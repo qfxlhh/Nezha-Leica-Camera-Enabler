@@ -1,5 +1,5 @@
 # Leica Camera Enabler (Safe)
-让小米17ultra普通版也能用上小米7 Ultra by Leica的滤镜和相册水印
+让小米17ultra普通版也能用上小米17 Ultra by Leica的滤镜和相册水印
 原作者：mexusbg；当前维护者：qfxlhh
 基于 https://github.com/mexusbg/Nezha-Leica-Camera-Enabler 修改
 修复了以下问题
