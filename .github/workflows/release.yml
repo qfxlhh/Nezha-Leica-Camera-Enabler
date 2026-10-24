@@ -41,18 +41,18 @@ jobs:
           # -X strips Info-ZIP extra fields (UT/ux); without it Magisk's installer
           # rejects the archive even though KernelSU accepts it.
           cd module
-          zip -X -r ../nezha_leica_camera_enabler_by_mexus.zip . -x '.*'
+          zip -X -r ../nezha_leica_camera_enabler_by_qfxlhh.zip . -x '.*'
 
       - name: Verify structure
         run: |
-          unzip -l nezha_leica_camera_enabler_by_mexus.zip
+          unzip -l nezha_leica_camera_enabler_by_qfxlhh.zip
           for f in \
             'META-INF/com/google/android/update-binary' \
             'customize.sh' \
             'LeicaFramePatcher.apk' \
             'module.prop' \
             'system.prop'; do
-            unzip -l nezha_leica_camera_enabler_by_mexus.zip | grep -q "$f" \
+            unzip -l nezha_leica_camera_enabler_by_qfxlhh.zip | grep -q "$f" \
               || { echo "MISSING: $f"; exit 1; }
           done
 
@@ -63,13 +63,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nezha_leica_camera_enabler
-          path: nezha_leica_camera_enabler_by_mexus.zip
+          path: nezha_leica_camera_enabler_by_qfxlhh.zip
 
       # Tagged builds only (v*): attach the raw, single flashable zip to the Release.
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: nezha_leica_camera_enabler_by_mexus.zip
+          files: nezha_leica_camera_enabler_by_qfxlhh.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

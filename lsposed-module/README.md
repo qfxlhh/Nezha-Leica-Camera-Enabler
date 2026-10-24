@@ -4,15 +4,16 @@ Companion LSPOSED/Xposed module for the Nezha Leica Camera Enabler Magisk module
 The Magisk module sets the Leica system props; this module patches the app behaviour
 that props alone cannot reach.
 
+Original author: mexusbg. Current maintainer: qfxlhh.
+
 ## What it fixes
 
-1. **6 Leica gallery frames rejected** — the HyperOS photo editor
-   (`com.miui.mediaeditor`) gates certain Leica frames behind a per-photo EXIF check
-   (`xi.y.a(Hi.a, String, D5.b)` → `Di.a`). Photos shot on nezha classify as
-   `xiaomi_series`, not Leica-cobrand, so those frames show
-   *"photo is not supported"*. The hook forces the gate to always return the
-   **Support** singleton (`Di.a$a.a`). The gate is a pure filter and feeds no render
-   data, so frames render correctly; absent EXIF text fields render blank (no crash).
+1. **Leica frames rejected after capture** — mediaeditor `2.10.43.0.6` rejects
+   camera-produced Leica templates because required photo fields fail the common
+   requirement check (`w60.x0.a(...)`) used by `MME_PhotoWatermarkTemplateUtils`.
+   Nezha photos are classified as non-Leica, producing *"unrecognized shooting
+   parameters"* when the same frame was available in Camera. The error result (`e70.a$b`) is replaced
+   with the existing success singleton (`e70.a$a`) so all Leica entry points agree.
 
 2. **Leica camera-island ring settings** — the Leica/Leitz variant has a control
    ring on the camera island; nezha does not, but the Leica props make its settings
@@ -35,9 +36,9 @@ that props alone cannot reach.
 3. **Watermark device name** — shows **"XIAOMI 17 Ultra by Leica"** (brand "XIAOMI"
    in the logo font, from the frame's own brand line) in both apps, replacing the
    stock "Leitzphone Powered by Xiaomi":
-   - *Gallery* (`com.miui.mediaeditor`): the name comes from `mj.g.n()` (model line,
-     EXIF-`Model` → hashCode switch) which `mj.g.k()` combines. Both are forced to
-     `WATERMARK_NAME`. Obfuscated single-letter names — see the re-mapping note below.
+   - *Gallery* (`com.miui.mediaeditor`): the model line is produced by
+     `o80.h.o(...)` in mediaeditor `2.10.43.0.6` and is forced to `WATERMARK_DEV`.
+     Obfuscated names are version-specific — see the re-mapping note below.
    - *Camera* (`com.android.camera`): the live-shot watermark text comes from a family
      of provider classes (subclasses of `C15705`) whose `mo26211d()` returns a
      `SparseArray<String[]>` = `[manufacturer, device]`. Both the class and method
@@ -47,7 +48,7 @@ that props alone cannot reach.
      `camera/CustomWatermark` does. The device slot is set to `WATERMARK_DEV`
      (`"17 Ultra by Leica"`); the frame prepends its own "XIAOMI" brand line.
 
-   To change the text, edit `WATERMARK_NAME` / `WATERMARK_DEV` in `HookEntry.java`
+   To change the text, edit `WATERMARK_DEV` in `HookEntry.java`
    and rebuild.
 
 ## Build
@@ -78,17 +79,15 @@ watermark hook. libxposed provides no `XposedHelpers`, so reflection is done by 
 2. In the LSPOSED manager: enable the module, tick scope **Gallery editor**
    (`com.miui.mediaeditor`), **Camera** (`com.android.camera`), and **Settings**
    (`com.android.settings`). (Recommended scope is declared in `scope.list`.)
-3. **Force-stop** all three (or reboot) so the hooks load.
-4. Verify: the non-working Leica frames are gone from the gallery picker; the
-   "Camera ring" entry is gone from both the camera settings and system Settings;
+3. **Force-stop** all three (or reboot) so the hooks load. Check the LSPosed log
+   for `gallery requirement hook active` and `gallery watermark name override active`.
+4. Verify: a Leica frame selected in Camera remains editable after reopening the
+   photo in Gallery; the "Camera ring" entry is gone from both the camera settings and system Settings;
    and the watermark reads "XIAOMI 17 Ultra by Leica" (camera + gallery).
 
 ## If a HyperOS update breaks it
 
-Hooks match by method *shape* where possible (e.g. the eligibility gate: static,
-3 params, 2nd is `String`, returns `Di.a`), so minor rebuilds usually survive.
-Logs go to the LSPOSED log — `adb logcat | grep LeicaFramePatcher` (tag
-`LSPosedFramework`) — and print class-lookup results and candidate methods when a
-name is gone. Re-map the `CLS_*` / obfuscated field-name constants in `HookEntry.java`.
-Markers to re-identify the gate class: family-tag literals `leica_series` /
-`xiaomi_series` / `lcc_series`, and EXIF keys `XiaomiProduct`, `themeCustomize`.
+The v1.8 remap targets mediaeditor `2.10.43.0.6`. When an update changes the
+obfuscated names, re-map `CLS_WM_NAME` and the `CLS_WM_VERIFY*` constants in
+`HookEntry.java`. The stable log marker is
+`MME_PhotoWatermarkTemplateUtils`.

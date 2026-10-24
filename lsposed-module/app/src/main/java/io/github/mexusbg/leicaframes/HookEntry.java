@@ -6,9 +6,6 @@ import android.util.SparseArray;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
 
 import org.luckypray.dexkit.DexKitBridge;
 import org.luckypray.dexkit.query.FindMethod;
@@ -26,8 +23,8 @@ import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
  * Modern (libxposed API 100+) Xposed module for the Xiaomi 17 Ultra (nezha) Leica tweaks.
  *
  * <ul>
- *   <li><b>Frames</b> — removes the Leica gallery frames that don't work on this device
- *       from the picker (their working duplicates remain later in the list).</li>
+ *   <li><b>Frames</b> — keeps camera-produced Leica frames eligible for editing in
+ *       the gallery, even though nezha photos classify as xiaomi_series.</li>
  *   <li><b>Ring</b> — hides the Leica camera-island "Camera ring" settings (in the camera
  *       and in system Settings); the Photography-Kit "Camera Grip" is left working.</li>
  *   <li><b>Watermark</b> — renames the device name to "XIAOMI 17 Ultra by Leica" in the
@@ -52,14 +49,12 @@ public class HookEntry extends XposedModule {
     // System Settings "Camera ring" (camera_mr) gate. Real framework name.
     private static final String CLS_INPUT_FEATURE = "miui.hardware.input.InputFeature";
 
-    // mediaeditor obfuscated names (OS3.0.332 / mediaeditor 6.x).
-    private static final String CLS_GATE = "xi.y";        // eligibility gate, method a()
-    private static final String CLS_VERDICT = "Di.a";     // verdict base type
-    private static final String CLS_UNSUPPORT = "Di.a$b"; // UnSupport verdict
-    private static final String CLS_PHOTO = "D5.b";       // photo/EXIF info (C0813b)
-    private static final String CLS_WM_EXIF = "mj.g";     // watermark EXIF/device-name helper
-    private static final String CLS_WM_VIEWMODEL =
-            "com.miui.mediaeditor.photo.watermark.PhotoWatermarkViewModel";
+    // mediaeditor 2.10.43.0.6 names.
+    private static final String CLS_WM_NAME = "o80.h";
+    private static final String CLS_WM_VERIFY = "w60.x0";
+    private static final String CLS_WM_VERIFY_RESULT = "e70.a";
+    private static final String CLS_WM_VERIFY_ERROR = "e70.a$b";
+    private static final String CLS_WM_VERIFY_SUCCESS = "e70.a$a";
 
     // Watermark device name. The frame renders a brand line ("XIAOMI", logo font) ahead
     // of the device text, so the device slot omits the leading "Xiaomi".
@@ -78,7 +73,7 @@ public class HookEntry extends XposedModule {
         if (cl == null) return;
 
         if (PKG_MEDIAEDITOR.equals(pkg)) {
-            safe("frame-filter", () -> hookHideUnsupportedFrames(cl));
+            safe("gallery watermark-requirements", () -> hookGalleryWatermarkRequirements(cl));
             safe("gallery watermark-name", () -> hookGalleryWatermarkName(cl));
         } else if (PKG_CAMERA.equals(pkg)) {
             safe("ring", () -> hookHideHandleRing(cl));
@@ -150,41 +145,21 @@ public class HookEntry extends XposedModule {
 
     // ------------------------------------------------------- watermark name (gallery) ---
 
-    /**
-     * Gallery watermark device name. {@code mj.g.n()} (model line) and {@code mj.g.k()}
-     * (manufacturer+model) are forced to {@link #WATERMARK_DEV}; the frame prepends its own
-     * "XIAOMI" brand line. Obfuscated single-letter names — logged for re-mapping if gone.
-     */
+    /** Gallery watermark device name for mediaeditor 2.10.43.0.6. */
     private void hookGalleryWatermarkName(ClassLoader cl) {
-        Class<?> exif = findClass(CLS_WM_EXIF, cl);
-        if (exif == null) {
-            log(Log.WARN, TAG, CLS_WM_EXIF + " not found — gallery name hook skipped.");
+        Class<?> nameHelper = findClass(CLS_WM_NAME, cl);
+        if (nameHelper == null) {
+            log(Log.WARN, TAG, CLS_WM_NAME + " not found — gallery name hook skipped.");
             return;
         }
-        int hooked = 0;
-        for (Method m : exif.getDeclaredMethods()) {
-            if (!Modifier.isStatic(m.getModifiers())) continue;
-            if (m.getReturnType() != String.class) continue;
-            if (m.getParameterTypes().length != 3) continue;
-            String n = m.getName();
-            if (!"n".equals(n) && !"k".equals(n)) continue;
-            hook(m).intercept(chain -> WATERMARK_DEV);
-            hooked++;
-            log(Log.INFO, TAG, "hooked gallery watermark-name method " + m);
+
+        Method nameMethod = findStaticStringMethod(nameHelper, "o", 3);
+        if (nameMethod == null) {
+            log(Log.WARN, TAG, "gallery watermark-name method o(...) not found.");
+            return;
         }
-        if (hooked == 0) {
-            log(Log.WARN, TAG, "no gallery watermark-name method matched on " + CLS_WM_EXIF
-                    + " — dumping static 3-arg String methods:");
-            for (Method m : exif.getDeclaredMethods()) {
-                if (Modifier.isStatic(m.getModifiers()) && m.getReturnType() == String.class
-                        && m.getParameterTypes().length == 3) {
-                    log(Log.WARN, TAG, "  candidate " + m);
-                }
-            }
-        } else {
-            log(Log.INFO, TAG, "gallery watermark name override active (" + hooked
-                    + " method(s) -> '" + WATERMARK_DEV + "').");
-        }
+        hook(nameMethod).intercept(chain -> WATERMARK_DEV);
+        log(Log.INFO, TAG, "gallery watermark name override active -> '" + WATERMARK_DEV + "'.");
     }
 
     // -------------------------------------------------------- watermark name (camera) ---
@@ -237,158 +212,80 @@ public class HookEntry extends XposedModule {
     // ------------------------------------------------------------- frames (gallery) -----
 
     /**
-     * Remove the Leica frames that don't work on this device from the picker. The whole
-     * list flows from one map — {@code PhotoWatermarkViewModel}'s static
-     * {@code (PhotoWatermarkViewModel, Map)->void} processor — so we intercept it and drop,
-     * from each category, the items whose eligibility verdict {@code xi.y.a(template, tag, photo)}
-     * is UnSupport ({@code Di.a$b}). The stored map and the LiveData share the object, so the
-     * in-place edit hides the frames everywhere.
+     * w60.x0.a(...) is called directly by MME_PhotoWatermarkTemplateUtils as well
+     * as by the higher-level agent validation. It returns e70.a$b when any required photo
+     * field is absent. Keep the original evaluation, then turn that verdict into
+     * its existing success singleton so the template may render with blank fields.
      */
-    private void hookHideUnsupportedFrames(final ClassLoader cl) {
-        Class<?> vmCls = findClass(CLS_WM_VIEWMODEL, cl);
-        Class<?> gate = findClass(CLS_GATE, cl);
-        Class<?> verdict = findClass(CLS_VERDICT, cl);
-        final Class<?> unsupport = findClass(CLS_UNSUPPORT, cl);
-        final Class<?> photoCls = findClass(CLS_PHOTO, cl);
-        if (vmCls == null || gate == null || verdict == null || unsupport == null) {
-            log(Log.WARN, TAG, "frame-filter name lookup failed (vm=" + vmCls + " gate=" + gate
-                    + " verdict=" + verdict + " unsupport=" + unsupport + ") — skipped.");
+    private void hookGalleryWatermarkRequirements(ClassLoader cl) {
+        Class<?> verify = findClass(CLS_WM_VERIFY, cl);
+        Class<?> result = findClass(CLS_WM_VERIFY_RESULT, cl);
+        Class<?> error = findClass(CLS_WM_VERIFY_ERROR, cl);
+        Class<?> success = findClass(CLS_WM_VERIFY_SUCCESS, cl);
+        if (verify == null || result == null || error == null || success == null) {
+            log(Log.WARN, TAG, "gallery requirement lookup failed (verify=" + verify
+                    + " result=" + result + " error=" + error + " success=" + success
+                    + ") — skipped.");
             return;
         }
-        final Method gateMethod = findGateMethod(gate, verdict);
-        if (gateMethod == null) {
-            log(Log.WARN, TAG, "eligibility method not found on " + CLS_GATE + " — filter skipped.");
-            return;
-        }
-        gateMethod.setAccessible(true);
 
-        Method processor = null;
-        for (Method m : vmCls.getDeclaredMethods()) {
-            if (!Modifier.isStatic(m.getModifiers())) continue;
-            if (m.getReturnType() != void.class) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (p.length == 2 && p[0] == vmCls && Map.class.isAssignableFrom(p[1])) {
-                processor = m;
+        Method requirements = null;
+        for (Method m : verify.getDeclaredMethods()) {
+            if (m.getReturnType() == result && m.getParameterTypes().length == 4) {
+                requirements = m;
                 break;
             }
         }
-        if (processor == null) {
-            log(Log.WARN, TAG, "watermark map processor not found on " + CLS_WM_VIEWMODEL + " — filter skipped.");
+        if (requirements == null) {
+            log(Log.WARN, TAG, "gallery requirement method not found on "
+                    + CLS_WM_VERIFY + " — skipped.");
             return;
         }
-        hook(processor).intercept(chain -> {
-            try {
-                filterFrameMap(chain.getArg(0), chain.getArg(1), gateMethod, unsupport, photoCls, cl);
-            } catch (Throwable t) {
-                log(Log.ERROR, TAG, "frame filter error: " + t);
+
+        final Object successResult = firstStaticAssignable(success, result);
+        if (successResult == null) {
+            log(Log.WARN, TAG, "gallery requirement success singleton not found on "
+                    + CLS_WM_VERIFY_SUCCESS + " — skipped.");
+            return;
+        }
+
+        final Class<?> errorType = error;
+        requirements.setAccessible(true);
+        hook(requirements).intercept(chain -> {
+            Object original = chain.proceed();
+            if (errorType.isInstance(original)) {
+                return successResult;
             }
-            return chain.proceed();
+            return original;
         });
-        log(Log.INFO, TAG, "unsupported-frame filter active on " + processor);
+        log(Log.INFO, TAG, "gallery requirement hook active on " + requirements + ".");
     }
 
-    /** xi.y.a(Hi.a, String, D5.b) -> Di.a, matched by shape (static, 3 args, 2nd String). */
-    private Method findGateMethod(Class<?> gate, Class<?> verdict) {
-        for (Method m : gate.getDeclaredMethods()) {
-            if (!Modifier.isStatic(m.getModifiers())) continue;
-            if (m.getReturnType() != verdict) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (p.length == 3 && p[1] == String.class) return m;
-        }
-        return null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private void filterFrameMap(Object viewModel, Object mapObj, Method gateMethod,
-                                Class<?> unsupport, Class<?> photoCls, ClassLoader cl) {
-        if (!(mapObj instanceof Map)) return;
-        Map<Object, Object> map = (Map<Object, Object>) mapObj;
-        Object photo = findPhoto(viewModel, photoCls, cl);
-        if (photo == null) {
-            log(Log.WARN, TAG, "frame filter — photo not found, leaving list unchanged.");
-            return;
-        }
-        int removed = 0, kept = 0;
-        for (Object category : new ArrayList<>(map.keySet())) {
-            String tag = getStringField(category, "f34714c");
-            if (tag == null) tag = firstStringField(category);
-            Object listObj = map.get(category);
-            if (!(listObj instanceof List)) continue;
-            List<Object> items = (List<Object>) listObj;
-            List<Object> keptItems = new ArrayList<>(items.size());
-            for (Object item : items) {
-                boolean drop = false;
-                try {
-                    Object template = getField(item, "f34715c");
-                    if (template == null) template = fieldByType(item, gateMethod.getParameterTypes()[0]);
-                    Object v = gateMethod.invoke(null, template, tag, photo);
-                    drop = unsupport.isInstance(v);
-                } catch (Throwable ignored) {
-                }
-                if (drop) removed++;
-                else {
-                    keptItems.add(item);
-                    kept++;
-                }
-            }
-            if (keptItems.size() != items.size()) {
-                try {
-                    items.clear();
-                    items.addAll(keptItems);
-                } catch (Throwable t1) {
-                    try {
-                        map.put(category, keptItems);
-                    } catch (Throwable t2) {
-                        log(Log.ERROR, TAG, "couldn't apply filter to a category: " + t2);
-                    }
-                }
-            }
-        }
-        log(Log.INFO, TAG, "frame filter — removed " + removed + ", kept " + kept + ".");
-    }
-
-    /** Edited photo (C0813b) from the shared photo-info service — same object the app uses. */
-    private Object findPhoto(Object viewModel, Class<?> photoCls, ClassLoader cl) {
-        if (photoCls == null) return null;
-        Object p = photoFromService(cl, photoCls);
-        if (p != null) return p;
-        try {
-            Object rd = getField(viewModel, "f34509s");
-            p = fieldByType(rd, photoCls);
-            if (p != null) return p;
-        } catch (Throwable ignored) {
-        }
-        p = fieldByType(viewModel, photoCls);
-        if (p != null) return p;
-        for (Field f : viewModel.getClass().getDeclaredFields()) {
+    /** Find the success singleton without depending on its field name. */
+    private Object firstStaticAssignable(Class<?> cls, Class<?> type) {
+        for (Field f : cls.getDeclaredFields()) {
+            if (!Modifier.isStatic(f.getModifiers())) continue;
+            if (!type.isAssignableFrom(f.getType())) continue;
             try {
                 f.setAccessible(true);
-                Object nested = f.get(viewModel);
-                if (nested != null && !(nested instanceof String)) {
-                    Object pp = fieldByType(nested, photoCls);
-                    if (pp != null) return pp;
-                }
+                Object value = f.get(null);
+                if (value != null) return value;
             } catch (Throwable ignored) {
             }
         }
         return null;
     }
 
-    /** Photo from the watermark photo-info service locator (xj.e$a.c(Th.f).obtainPhotoInfo()). */
-    private Object photoFromService(ClassLoader cl, Class<?> photoCls) {
-        try {
-            Class<?> registry = findClass("xj.e$a", cl);
-            Class<?> iface = findClass("Th.f", cl);
-            if (registry == null || iface == null) return null;
-            Object service = callStatic(registry, "c", new Class<?>[]{Class.class}, iface);
-            if (service == null) return null;
-            Object photoInfo = callInstance(service, "obtainPhotoInfo");
-            if (photoInfo == null) return null;
-            return fieldByType(photoInfo, photoCls);
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "photo service lookup failed: " + t);
-            return null;
+    private Method findStaticStringMethod(Class<?> cls, String name, int paramCount) {
+        for (Method m : cls.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers())) continue;
+            if (m.getReturnType() != String.class) continue;
+            if (!m.getName().equals(name)) continue;
+            if (m.getParameterTypes().length != paramCount) continue;
+            m.setAccessible(true);
+            return m;
         }
+        return null;
     }
 
     // ----------------------------------------------------------------- reflection -------
@@ -412,78 +309,4 @@ public class HookEntry extends XposedModule {
         return null;
     }
 
-    private Object callStatic(Class<?> cls, String name, Class<?>[] paramTypes, Object... args)
-            throws Exception {
-        Method m = cls.getDeclaredMethod(name, paramTypes);
-        m.setAccessible(true);
-        return m.invoke(null, args);
-    }
-
-    private Object callInstance(Object obj, String name) throws Exception {
-        for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-            for (Method m : c.getDeclaredMethods()) {
-                if (m.getName().equals(name) && m.getParameterTypes().length == 0) {
-                    m.setAccessible(true);
-                    return m.invoke(obj);
-                }
-            }
-        }
-        throw new NoSuchMethodException(name);
-    }
-
-    /** Instance field by exact name, searching the class hierarchy. */
-    private Object getField(Object obj, String name) {
-        for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-            try {
-                Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                return f.get(obj);
-            } catch (NoSuchFieldException ignored) {
-            } catch (Throwable t) {
-                return null;
-            }
-        }
-        return null;
-    }
-
-    private String getStringField(Object obj, String name) {
-        Object v = getField(obj, name);
-        return (v instanceof String) ? (String) v : null;
-    }
-
-    /** First non-null instance field assignable to type, searching the hierarchy. */
-    private Object fieldByType(Object obj, Class<?> type) {
-        if (obj == null || type == null) return null;
-        for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-            for (Field f : c.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (!type.isAssignableFrom(f.getType())) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(obj);
-                    if (v != null) return v;
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-        return null;
-    }
-
-    /** First non-null String instance field, searching the hierarchy. */
-    private String firstStringField(Object obj) {
-        if (obj == null) return null;
-        for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-            for (Field f : c.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (f.getType() != String.class) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(obj);
-                    if (v instanceof String) return (String) v;
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-        return null;
-    }
 }
