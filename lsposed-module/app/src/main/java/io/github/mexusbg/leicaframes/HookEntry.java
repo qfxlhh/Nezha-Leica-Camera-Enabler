@@ -55,6 +55,7 @@ public class HookEntry extends XposedModule {
     private static final String CLS_WM_VERIFY_RESULT = "e70.a";
     private static final String CLS_WM_VERIFY_ERROR = "e70.a$b";
     private static final String CLS_WM_VERIFY_SUCCESS = "e70.a$a";
+    private static final String CLS_NETWORK_TIME = "aa0.a";
 
     // Watermark device name. The frame renders a brand line ("XIAOMI", logo font) ahead
     // of the device text, so the device slot omits the leading "Xiaomi".
@@ -75,6 +76,7 @@ public class HookEntry extends XposedModule {
         if (PKG_MEDIAEDITOR.equals(pkg)) {
             safe("gallery watermark-requirements", () -> hookGalleryWatermarkRequirements(cl));
             safe("gallery watermark-name", () -> hookGalleryWatermarkName(cl));
+            safe("watermark network-time", () -> hookWatermarkNetworkTime(cl));
         } else if (PKG_CAMERA.equals(pkg)) {
             safe("ring", () -> hookHideHandleRing(cl));
             String apk = param.getApplicationInfo() != null ? param.getApplicationInfo().sourceDir : null;
@@ -158,7 +160,17 @@ public class HookEntry extends XposedModule {
             log(Log.WARN, TAG, "gallery watermark-name method o(...) not found.");
             return;
         }
-        hook(nameMethod).intercept(chain -> WATERMARK_DEV);
+
+        Method exifGetter = findMethod(nameMethod.getParameterTypes()[0], "f", 1);
+        if (exifGetter == null) {
+            log(Log.WARN, TAG, "gallery watermark-name EXIF getter not found — skipped.");
+            return;
+        }
+
+        hook(nameMethod).intercept(chain ->
+                isTargetCameraPhoto(chain.getArg(0), exifGetter)
+                        ? WATERMARK_DEV
+                        : chain.proceed());
         log(Log.INFO, TAG, "gallery watermark name override active -> '" + WATERMARK_DEV + "'.");
     }
 
@@ -242,6 +254,12 @@ public class HookEntry extends XposedModule {
             return;
         }
 
+        Method exifGetter = findMethod(requirements.getParameterTypes()[2], "f", 1);
+        if (exifGetter == null) {
+            log(Log.WARN, TAG, "gallery EXIF getter not found — skipped.");
+            return;
+        }
+
         final Object successResult = firstStaticAssignable(success, result);
         if (successResult == null) {
             log(Log.WARN, TAG, "gallery requirement success singleton not found on "
@@ -253,12 +271,90 @@ public class HookEntry extends XposedModule {
         requirements.setAccessible(true);
         hook(requirements).intercept(chain -> {
             Object original = chain.proceed();
-            if (errorType.isInstance(original)) {
+            if (errorType.isInstance(original)
+                    && isTargetCameraPhoto(chain.getArg(2), exifGetter)) {
                 return successResult;
             }
             return original;
         });
         log(Log.INFO, TAG, "gallery requirement hook active on " + requirements + ".");
+    }
+
+    /**
+     * Only bypass the gallery/EXIF classification for photos carrying original
+     * Xiaomi 17 Ultra camera metadata. Screenshots and imported images without a
+     * camera capture timestamp keep the stock unsupported-photo error.
+     */
+    private boolean isTargetCameraPhoto(Object photo, Method getter) {
+        String make = exif(photo, getter, "Make");
+        String model = exif(photo, getter, "Model");
+        String date = exif(photo, getter, "DateTimeOriginal");
+        String product = exif(photo, getter, "XiaomiProduct");
+
+        boolean xiaomi = containsIgnoreCase(make, "Xiaomi") || nonEmpty(product);
+        boolean targetDevice = containsIgnoreCase(model, "17 Ultra")
+                || containsIgnoreCase(model, "nezha")
+                || containsIgnoreCase(product, "17 Ultra")
+                || containsIgnoreCase(product, "nezha");
+        return xiaomi && targetDevice && nonEmpty(date);
+    }
+
+    private String exif(Object photo, Method getter, String key) {
+        if (photo == null) return null;
+        try {
+            Object value = getter.invoke(photo, key);
+            return value instanceof String ? ((String) value).trim() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private boolean containsIgnoreCase(String value, String expected) {
+        return value != null
+                && value.toLowerCase(java.util.Locale.ROOT)
+                .contains(expected.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    private boolean nonEmpty(String value) {
+        return value != null && !value.isEmpty();
+    }
+
+    /**
+     * Watermark config transformation asks Xiaomi for network time with a
+     * 2000 ms timeout. Substitute the device clock only for that exact call;
+     * other app features use 1500/5000 ms and remain unchanged.
+     */
+    private void hookWatermarkNetworkTime(ClassLoader cl) {
+        Class<?> networkTime = findClass(CLS_NETWORK_TIME, cl);
+        if (networkTime == null) {
+            log(Log.WARN, TAG, CLS_NETWORK_TIME + " not found — network-time hook skipped.");
+            return;
+        }
+
+        Method target = null;
+        for (Method m : networkTime.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers())) continue;
+            if (m.getReturnType() != long.class) continue;
+            Class<?>[] p = m.getParameterTypes();
+            if (p.length == 1 && p[0] == long.class && "a".equals(m.getName())) {
+                target = m;
+                break;
+            }
+        }
+        if (target == null) {
+            log(Log.WARN, TAG, "network-time method a(long) not found — skipped.");
+            return;
+        }
+
+        target.setAccessible(true);
+        hook(target).intercept(chain -> {
+            Object arg = chain.getArg(0);
+            if (arg instanceof Number && ((Number) arg).longValue() == 2000L) {
+                return System.currentTimeMillis();
+            }
+            return chain.proceed();
+        });
+        log(Log.INFO, TAG, "watermark network-time hook active (2000 ms only).");
     }
 
     /** Find the success singleton without depending on its field name. */

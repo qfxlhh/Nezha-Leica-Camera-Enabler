@@ -14,6 +14,12 @@ Original author: mexusbg. Current maintainer: qfxlhh.
    Nezha photos are classified as non-Leica, producing *"unrecognized shooting
    parameters"* when the same frame was available in Camera. The error result (`e70.a$b`) is replaced
    with the existing success singleton (`e70.a$a`) so all Leica entry points agree.
+   Validation and name replacement are limited to photos carrying Xiaomi 17 Ultra
+   (`17 Ultra`/`nezha`) camera Make/Model metadata and `DateTimeOriginal`. Screenshots,
+   imported images, and photos from other device models keep the stock behavior and name.
+   The watermark config's 2000 ms network-time request is also replaced with the
+   device clock; other network-time callers remain unchanged. This reduces online
+   watermark loading time while retaining cached cloud config and resource download.
 
 2. **Leica camera-island ring settings** — the Leica/Leitz variant has a control
    ring on the camera island; nezha does not, but the Leica props make its settings
@@ -80,14 +86,15 @@ watermark hook. libxposed provides no `XposedHelpers`, so reflection is done by 
    (`com.miui.mediaeditor`), **Camera** (`com.android.camera`), and **Settings**
    (`com.android.settings`). (Recommended scope is declared in `scope.list`.)
 3. **Force-stop** all three (or reboot) so the hooks load. Check the LSPosed log
-   for `gallery requirement hook active` and `gallery watermark name override active`.
+   for `gallery requirement hook active`, `gallery watermark name override active`,
+   and `watermark network-time hook active`.
 4. Verify: a Leica frame selected in Camera remains editable after reopening the
    photo in Gallery; the "Camera ring" entry is gone from both the camera settings and system Settings;
    and the watermark reads "XIAOMI 17 Ultra by Leica" (camera + gallery).
 
 ## If a HyperOS update breaks it
 
-The v1.8 remap targets mediaeditor `2.10.43.0.6`. When an update changes the
+The v1.9.3 remap targets mediaeditor `2.10.43.0.6`. When an update changes the
 obfuscated names, re-map `CLS_WM_NAME` and the `CLS_WM_VERIFY*` constants in
 `HookEntry.java`. The stable log marker is
 `MME_PhotoWatermarkTemplateUtils`.
