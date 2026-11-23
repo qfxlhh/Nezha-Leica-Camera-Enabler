@@ -49,13 +49,14 @@ public class HookEntry extends XposedModule {
     // System Settings "Camera ring" (camera_mr) gate. Real framework name.
     private static final String CLS_INPUT_FEATURE = "miui.hardware.input.InputFeature";
 
-    // mediaeditor 2.10.43.0.6 names.
-    private static final String CLS_WM_NAME = "o80.h";
-    private static final String CLS_WM_VERIFY = "w60.x0";
-    private static final String CLS_WM_VERIFY_RESULT = "e70.a";
-    private static final String CLS_WM_VERIFY_ERROR = "e70.a$b";
-    private static final String CLS_WM_VERIFY_SUCCESS = "e70.a$a";
-    private static final String CLS_NETWORK_TIME = "aa0.a";
+    // mediaeditor obfuscated names, newest first. Xiaomi re-obfuscates the whole app on
+    // every gallery update, so each lookup tries these in order and resolves the result
+    // shape structurally from whatever class matched.
+    //   2.10.43.1.4 (versionCode 210994314) -> x60.c1 / p80.i / ba0.a
+    //   2.10.43.0.6 (versionCode 210430006) -> w60.x0 / o80.h / aa0.a
+    private static final String[] WM_VERIFY_CLASSES = {"x60.c1", "w60.x0"};
+    private static final String[] WM_NAME_CLASSES = {"p80.i", "o80.h"};
+    private static final String[] NETWORK_TIME_CLASSES = {"ba0.a", "aa0.a"};
 
     // Watermark device name. The frame renders a brand line ("XIAOMI", logo font) ahead
     // of the device text, so the device slot omits the leading "Xiaomi".
@@ -147,21 +148,31 @@ public class HookEntry extends XposedModule {
 
     // ------------------------------------------------------- watermark name (gallery) ---
 
-    /** Gallery watermark device name for mediaeditor 2.10.43.0.6. */
+    /**
+     * Gallery watermark device name. Located by shape: a static method returning String
+     * with three parameters whose first parameter is the EXIF reader (a class declaring
+     * {@code String get(String)}). The obfuscated class/method names change every update.
+     */
     private void hookGalleryWatermarkName(ClassLoader cl) {
-        Class<?> nameHelper = findClass(CLS_WM_NAME, cl);
-        if (nameHelper == null) {
-            log(Log.WARN, TAG, CLS_WM_NAME + " not found — gallery name hook skipped.");
-            return;
+        Class<?> nameHelper = null;
+        Method nameMethod = null;
+        for (String candidate : WM_NAME_CLASSES) {
+            Class<?> cls = findClass(candidate, cl);
+            if (cls == null) continue;
+            nameMethod = findStaticStringMethod(cls, "o", 3);
+            if (nameMethod == null) nameMethod = findStaticStringWithExif(cls, 3);
+            if (nameMethod != null) {
+                nameHelper = cls;
+                break;
+            }
         }
-
-        Method nameMethod = findStaticStringMethod(nameHelper, "o", 3);
         if (nameMethod == null) {
-            log(Log.WARN, TAG, "gallery watermark-name method o(...) not found.");
+            log(Log.WARN, TAG, "gallery watermark-name method not found in "
+                    + java.util.Arrays.toString(WM_NAME_CLASSES) + " — skipped.");
             return;
         }
 
-        Method exifGetter = findMethod(nameMethod.getParameterTypes()[0], "f", 1);
+        Method exifGetter = findStringGetter(nameMethod.getParameterTypes()[0]);
         if (exifGetter == null) {
             log(Log.WARN, TAG, "gallery watermark-name EXIF getter not found — skipped.");
             return;
@@ -171,7 +182,8 @@ public class HookEntry extends XposedModule {
                 isTargetCameraPhoto(chain.getArg(0), exifGetter)
                         ? WATERMARK_DEV
                         : chain.proceed());
-        log(Log.INFO, TAG, "gallery watermark name override active -> '" + WATERMARK_DEV + "'.");
+        log(Log.INFO, TAG, "gallery watermark name override active via "
+                + nameHelper.getName() + "." + nameMethod.getName() + " -> '" + WATERMARK_DEV + "'.");
     }
 
     // -------------------------------------------------------- watermark name (camera) ---
@@ -224,60 +236,86 @@ public class HookEntry extends XposedModule {
     // ------------------------------------------------------------- frames (gallery) -----
 
     /**
-     * w60.x0.a(...) is called directly by MME_PhotoWatermarkTemplateUtils as well
-     * as by the higher-level agent validation. It returns e70.a$b when any required photo
-     * field is absent. Keep the original evaluation, then turn that verdict into
-     * its existing success singleton so the template may render with blank fields.
+     * The gallery requirement check (2.10.43.1.4: {@code x60.c1.a(Watermark, String,
+     * ExifReader, WatermarkGroup)}) returns an error verdict ({@code f70.a$b}) when a
+     * required photo field is absent, which surfaces as “未识别到拍摄参数，请更换图片后重试”.
+     * Keep the original evaluation, then turn that verdict into its existing success
+     * singleton ({@code f70.a$a}) for photos the Xiaomi 17 Ultra camera produced, so the
+     * Leica frame renders despite empty fields.
+     *
+     * <p>Located by shape, not by name: four parameters, non-primitive return type whose
+     * nested classes are the result variants, and an EXIF reader as the third parameter.
+     * The success/error variants are resolved from the returned type itself, so a
+     * re-obfuscated gallery build only needs the outer class name updated.
      */
     private void hookGalleryWatermarkRequirements(ClassLoader cl) {
-        Class<?> verify = findClass(CLS_WM_VERIFY, cl);
-        Class<?> result = findClass(CLS_WM_VERIFY_RESULT, cl);
-        Class<?> error = findClass(CLS_WM_VERIFY_ERROR, cl);
-        Class<?> success = findClass(CLS_WM_VERIFY_SUCCESS, cl);
-        if (verify == null || result == null || error == null || success == null) {
-            log(Log.WARN, TAG, "gallery requirement lookup failed (verify=" + verify
-                    + " result=" + result + " error=" + error + " success=" + success
-                    + ") — skipped.");
-            return;
-        }
-
         Method requirements = null;
-        for (Method m : verify.getDeclaredMethods()) {
-            if (m.getReturnType() == result && m.getParameterTypes().length == 4) {
+        Class<?> resultType = null;
+        for (String candidate : WM_VERIFY_CLASSES) {
+            Class<?> cls = findClass(candidate, cl);
+            if (cls == null) continue;
+            for (Method m : cls.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers())) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length != 4) continue;
+                Class<?> r = m.getReturnType();
+                if (r.isPrimitive() || r.isArray()) continue;
+                if (r.getDeclaredClasses().length == 0) continue;
+                if (findStringGetter(p[2]) == null) continue;
                 requirements = m;
+                resultType = r;
                 break;
             }
+            if (requirements != null) break;
         }
         if (requirements == null) {
-            log(Log.WARN, TAG, "gallery requirement method not found on "
-                    + CLS_WM_VERIFY + " — skipped.");
+            log(Log.WARN, TAG, "gallery requirement method not found in "
+                    + java.util.Arrays.toString(WM_VERIFY_CLASSES) + " — skipped.");
             return;
         }
 
-        Method exifGetter = findMethod(requirements.getParameterTypes()[2], "f", 1);
+        Method exifGetter = findStringGetter(requirements.getParameterTypes()[2]);
         if (exifGetter == null) {
             log(Log.WARN, TAG, "gallery EXIF getter not found — skipped.");
             return;
         }
 
-        final Object successResult = firstStaticAssignable(success, result);
-        if (successResult == null) {
-            log(Log.WARN, TAG, "gallery requirement success singleton not found on "
-                    + CLS_WM_VERIFY_SUCCESS + " — skipped.");
+        Class<?>[] variants = resultType.getDeclaredClasses();
+        Object successResult = null;
+        for (Class<?> variant : variants) {
+            Object value = firstStaticAssignable(variant, resultType);
+            if (value != null) {
+                successResult = value;
+                break;
+            }
+        }
+        Class<?> errorType = null;
+        for (Class<?> variant : variants) {
+            if (successResult == null || !variant.isInstance(successResult)) {
+                errorType = variant;
+                break;
+            }
+        }
+        if (successResult == null || errorType == null) {
+            log(Log.WARN, TAG, "gallery requirement result variants not found on "
+                    + resultType.getName() + " — skipped.");
             return;
         }
 
-        final Class<?> errorType = error;
+        final Object success = successResult;
+        final Class<?> error = errorType;
         requirements.setAccessible(true);
         hook(requirements).intercept(chain -> {
             Object original = chain.proceed();
-            if (errorType.isInstance(original)
+            if (error.isInstance(original)
                     && isTargetCameraPhoto(chain.getArg(2), exifGetter)) {
-                return successResult;
+                return success;
             }
             return original;
         });
-        log(Log.INFO, TAG, "gallery requirement hook active on " + requirements + ".");
+        log(Log.INFO, TAG, "gallery requirement hook active on " + requirements
+                + " (result=" + resultType.getName()
+                + ", success=" + success.getClass().getName() + ").");
     }
 
     /**
@@ -325,24 +363,26 @@ public class HookEntry extends XposedModule {
      * other app features use 1500/5000 ms and remain unchanged.
      */
     private void hookWatermarkNetworkTime(ClassLoader cl) {
-        Class<?> networkTime = findClass(CLS_NETWORK_TIME, cl);
-        if (networkTime == null) {
-            log(Log.WARN, TAG, CLS_NETWORK_TIME + " not found — network-time hook skipped.");
-            return;
-        }
-
+        Class<?> networkTime = null;
         Method target = null;
-        for (Method m : networkTime.getDeclaredMethods()) {
-            if (!Modifier.isStatic(m.getModifiers())) continue;
-            if (m.getReturnType() != long.class) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (p.length == 1 && p[0] == long.class && "a".equals(m.getName())) {
-                target = m;
-                break;
+        for (String candidate : NETWORK_TIME_CLASSES) {
+            Class<?> cls = findClass(candidate, cl);
+            if (cls == null) continue;
+            for (Method m : cls.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers())) continue;
+                if (m.getReturnType() != long.class) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length == 1 && p[0] == long.class && "a".equals(m.getName())) {
+                    target = m;
+                    networkTime = cls;
+                    break;
+                }
             }
+            if (target != null) break;
         }
         if (target == null) {
-            log(Log.WARN, TAG, "network-time method a(long) not found — skipped.");
+            log(Log.WARN, TAG, "network-time method a(long) not found in "
+                    + java.util.Arrays.toString(NETWORK_TIME_CLASSES) + " — skipped.");
             return;
         }
 
@@ -354,7 +394,8 @@ public class HookEntry extends XposedModule {
             }
             return chain.proceed();
         });
-        log(Log.INFO, TAG, "watermark network-time hook active (2000 ms only).");
+        log(Log.INFO, TAG, "watermark network-time hook active on "
+                + networkTime.getName() + ".a(long) (2000 ms only).");
     }
 
     /** Find the success singleton without depending on its field name. */
@@ -382,6 +423,42 @@ public class HookEntry extends XposedModule {
             return m;
         }
         return null;
+    }
+
+    /**
+     * Static {@code String} method of the given arity whose first parameter looks like the
+     * gallery EXIF reader — name-independent fallback for re-obfuscated mediaeditor builds.
+     */
+    private Method findStaticStringWithExif(Class<?> cls, int paramCount) {
+        for (Method m : cls.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers())) continue;
+            if (m.getReturnType() != String.class) continue;
+            if (m.getParameterTypes().length != paramCount) continue;
+            if (findStringGetter(m.getParameterTypes()[0]) == null) continue;
+            m.setAccessible(true);
+            return m;
+        }
+        return null;
+    }
+
+    /**
+     * The mediaeditor EXIF reader exposes {@code String get(String key)}; the obfuscated
+     * name changes between builds (2.10.43.x uses {@code f}), so match the shape instead.
+     */
+    private Method findStringGetter(Class<?> cls) {
+        if (cls == null) return null;
+        Method fallback = null;
+        for (Method m : cls.getDeclaredMethods()) {
+            if (m.getParameterTypes().length != 1) continue;
+            if (m.getParameterTypes()[0] != String.class) continue;
+            if (m.getReturnType() != String.class) continue;
+            m.setAccessible(true);
+            // 2.10.43.x exposes the EXIF reader as f(String); keep it first and only fall
+            // back to any other String->String method if a future build renames it.
+            if ("f".equals(m.getName())) return m;
+            if (fallback == null) fallback = m;
+        }
+        return fallback;
     }
 
     // ----------------------------------------------------------------- reflection -------

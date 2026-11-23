@@ -8,12 +8,13 @@ Original author: mexusbg. Current maintainer: qfxlhh.
 
 ## What it fixes
 
-1. **Leica frames rejected after capture** — mediaeditor `2.10.43.0.6` rejects
-   camera-produced Leica templates because required photo fields fail the common
-   requirement check (`w60.x0.a(...)`) used by `MME_PhotoWatermarkTemplateUtils`.
+1. **Leica frames rejected after capture** — mediaeditor `2.10.43.1.4` (and the earlier
+   `2.10.43.0.6`) rejects camera-produced Leica templates because required photo fields
+   fail the common requirement check (`x60.c1.a(...)` / `w60.x0.a(...)`) used by the
+   gallery watermark template validation.
    Nezha photos are classified as non-Leica, producing *"unrecognized shooting
-   parameters"* when the same frame was available in Camera. The error result (`e70.a$b`) is replaced
-   with the existing success singleton (`e70.a$a`) so all Leica entry points agree.
+   parameters"* when the same frame was available in Camera. The error result (`f70.a$b`) is replaced
+   with the existing success singleton (`f70.a$a`) so all Leica entry points agree.
    Validation and name replacement are limited to photos carrying Xiaomi 17 Ultra
    (`17 Ultra`/`nezha`) camera Make/Model metadata and `DateTimeOriginal`. Screenshots,
    imported images, and photos from other device models keep the stock behavior and name.
@@ -94,7 +95,24 @@ watermark hook. libxposed provides no `XposedHelpers`, so reflection is done by 
 
 ## If a HyperOS update breaks it
 
-The v1.9.3 remap targets mediaeditor `2.10.43.0.6`. When an update changes the
-obfuscated names, re-map `CLS_WM_NAME` and the `CLS_WM_VERIFY*` constants in
-`HookEntry.java`. The stable log marker is
-`MME_PhotoWatermarkTemplateUtils`.
+The gallery hooks resolve their targets by **shape**, so a rebuilt mediaeditor usually only
+needs the outer class names refreshed. Current mappings:
+
+| mediaeditor | requirement check | watermark name | network time |
+|-------------|-------------------|----------------|--------------|
+| 2.10.43.1.4 (versionCode 210994314) | `x60.c1.a(Watermark, String, ExifReader, WatermarkGroup)` → `f70.a` | `p80.i.o(ExifReader, WatermarkGroup, boolean)` | `ba0.a.a(long)` |
+| 2.10.43.0.6 (versionCode 210430006) | `w60.x0.a(...)` → `e70.a` | `o80.h.o(...)` | `aa0.a.a(long)` |
+
+The arrays `WM_VERIFY_CLASSES`, `WM_NAME_CLASSES` and `NETWORK_TIME_CLASSES` in
+`HookEntry.java` list the known names newest-first; add the new name at the front when an
+update rewrites them again. The requirement hook derives the result type and its
+success/error variants from the matched method's return type, so only the outer class name
+is version-specific. The EXIF reader is matched structurally (`String → String`), not by
+name. Stable log markers at runtime:
+
+- `gallery requirement hook active on …` (plus `result=` / `success=`)
+- `gallery watermark name override active via …`
+- `watermark network-time hook active on …`
+
+If one disappears from logcat after an update, that lookup missed and the corresponding
+class name needs refreshing.
